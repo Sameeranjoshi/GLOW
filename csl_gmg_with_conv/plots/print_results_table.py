@@ -80,6 +80,13 @@ def main():
 
     col_w = 30
     sep = "=" * (14 + len(configs) * (col_w + 3))
+
+    # Section banner — required by h200_vs_cs3.py and print_512_table.py parsers
+    print("")
+    print("=" * 120)
+    print("  WITH convergence check")
+    print("=" * 120)
+
     print(sep)
     hdr = "             |"
     for c in configs:

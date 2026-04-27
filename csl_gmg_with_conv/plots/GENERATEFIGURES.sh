@@ -154,6 +154,18 @@ run_perf all_responses_6_6_6_unoptimized.txt out_6_6_6_unoptimized.txt
 run_perf all_responses_6_6_6.txt          out_6_6_6.txt
 
 # ----------------------------------------------------------------------------
+# Step 2.5: results tables (must run before Step 3, which consumes wse_numbers.txt)
+# ----------------------------------------------------------------------------
+echo ""
+echo "=========================================="
+echo "Step 2.5: Results tables"
+echo "=========================================="
+
+echo "  print_results_table.py -> wse_numbers.txt"
+python print_results_table.py --build-dir ../build/ > wse_numbers.txt 2>> "${LOGFILE}"
+{ echo "--- print_results_table.py (wrote wse_numbers.txt) ---"; echo; } >> "${LOGFILE}"
+
+# ----------------------------------------------------------------------------
 # Step 3: analysis/comparison scripts that depend on out_*.txt
 # ----------------------------------------------------------------------------
 echo ""
@@ -208,17 +220,6 @@ if [ -s "${ROOFLINE_SAMPLE}" ]; then
 else
     echo "  SKIP roofline_analysis.py: no 512³ 6/6/6 response.txt"
 fi
-
-# ----------------------------------------------------------------------------
-# Step 6: results tables
-# ----------------------------------------------------------------------------
-# echo ""
-# echo "=========================================="
-# echo "Step 6: Results tables"
-# echo "=========================================="
-
-# echo "  print_results_table.py -> full results table"
-# { echo "--- print_results_table.py ---"; python print_results_table.py --build ../build/ 2>&1; echo; } | tee -a "${LOGFILE}"
 
 # ----------------------------------------------------------------------------
 # Done
