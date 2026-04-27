@@ -87,6 +87,24 @@ else
 fi
 
 # ----------------------------------------------------------------------------
+# Step 0.5: rename shallow V-cycle dirs to disambiguate from full-depth runs
+#
+# compile_and_run_wse3.py writes every run to build/out_dir_S<size>x_L<lvl>_...,
+# so shallow 6/6/6 runs (one level less than full depth) collide with the regular
+# 6/6/6 glob. Prepending "shallow_" lets the build/shallow_* glob below pick them
+# up and keeps the regular build/out_dir_* glob clean. Idempotent.
+# ----------------------------------------------------------------------------
+mkdir -p build
+for spec in S16x_L2 S32x_L3 S64x_L4 S128x_L5 S256x_L6 S512x_L7; do
+    src="build/out_dir_${spec}_M100_P6_P6_B6"
+    dst="build/shallow_out_dir_${spec}_M100_P6_P6_B6"
+    if [ -d "${src}" ] && [ ! -d "${dst}" ]; then
+        mv "${src}" "${dst}"
+        echo "  renamed $(basename ${src}) -> $(basename ${dst})"
+    fi
+done
+
+# ----------------------------------------------------------------------------
 # Step 1: aggregate response.txt files into all_responses_*.txt
 # ----------------------------------------------------------------------------
 echo ""
@@ -96,7 +114,6 @@ echo "=========================================="
 
 # All aggregated all_responses_*.txt files are written into build/ (alongside
 # the out_dir_*/ they were aggregated from). Plot scripts read them from build/.
-mkdir -p build
 collect() {
     local pattern="$1"
     local outfile="build/$2"
