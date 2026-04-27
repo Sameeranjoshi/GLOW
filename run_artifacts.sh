@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# run_all.sh — drive GLOW end-to-end across both repos:
+# run_artifacts.sh — drive GLOW end-to-end across both repos:
 #   1. csl_gmg_with_conv  : compile + CS-3 device run (V-cycle sweep)
 #   2. w_cycle            : compile + CS-3 device run (W-cycle, 256^3)
 #   3. csl_gmg_with_conv/plots : aggregate + regenerate all figures/tables
 #
 # Usage:
-#   ./run_all.sh                # full pipeline
-#   ./run_all.sh --skip-vcycle  # skip V-cycle device runs (use cached build/)
-#   ./run_all.sh --skip-wcycle  # skip W-cycle device runs
-#   ./run_all.sh --plots-only   # just (re)generate plots
+#   ./run_artifacts.sh                # full pipeline
+#   ./run_artifacts.sh --skip-vcycle  # skip V-cycle device runs (use cached build/)
+#   ./run_artifacts.sh --skip-wcycle  # skip W-cycle device runs
+#   ./run_artifacts.sh --plots-only   # just (re)generate plots
 #
 set -euo pipefail
 
