@@ -121,6 +121,7 @@ source /path/to/sdk_venv/bin/activate
 pip install -r /path/to/sdk/req.txt        # cerebras-sdk + cerebras-appliance
 
 # 2. Install this repo's host-side and plotting dependencies
+git clone https://github.com/Sameeranjoshi/GLOW.git
 cd GLOW/
 pip install -r requirements.txt
 ```
