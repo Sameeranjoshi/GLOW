@@ -1,0 +1,115 @@
+const ts = @import_module("<time/internal>");
+
+const tsc_size_words = ts.tsc_size_words;
+
+param timerCount;
+
+const timestamp_size = tsc_size_words;
+const timerType: type = [timestamp_size]u16;
+const timerType32: type = [timestamp_size + 1]u16;
+
+var tscBufferStart: [timerCount, timestamp_size]u16;
+var tscBufferStop: [timerCount, timestamp_size]u16;
+
+//result and a can be the same
+fn subtract_timestamps(a: [*]u16, b: [*]u16, result: [*]u16) void {
+  //ASSUMES a > b
+  var borrow: u16 = 0;
+  var nborrow: u16 = 0;
+
+  //subtract low bits with borrow bit
+  nborrow = @as(u16, a[0] < b[0] );
+  result[0] = a[0] - b[0];
+  borrow = @as(u16, a[1] < b[1] ) | (nborrow & @as(u16, b[1] == a[1]) );
+  result[1] = a[1] - b[1] - nborrow;
+  result[2] = a[2] - b[2] - borrow;
+}
+
+//result and a can be the same
+fn add_timestamps(a: [*]u16, b: [*]u16, result: [*]u16) void {
+  //low portion
+  var tmp = @as(u32, a[0]) + @as(u32, b[0]);
+  result[0] = @as(u16, 0xFFFF & tmp);
+  var carry: u16 = @as(u16, tmp >> 16);
+
+  //mid portion
+  tmp = @as(u32, a[1]) + @as(u32, b[1]) + @as(u32, carry);
+  result[1] = @as(u16, 0xFFFF & tmp);
+  carry = @as(u16, tmp >> 16);
+
+  //high portion
+  tmp = @as(u32, a[2]) + @as(u32, b[2]) + @as(u32, carry);
+  result[2] = @as(u16, 0xFFFF & tmp);
+  carry = @as(u16, tmp >> 16);
+}
+
+inline fn start(timerId: i16) void {
+  ts.get_timestamp(@ptrcast(*timerType, &tscBufferStart[timerId,0]));
+}
+
+inline fn stop(timerId: i16) void {
+  ts.get_timestamp(@ptrcast(*timerType, &tscBufferStop[timerId,0]));
+}
+
+fn elapsed(timerId: i16, result: *timerType) void {
+  if (tscBufferStop[timerId,2] >= tscBufferStart[timerId,2]) {
+    subtract_timestamps(
+      @ptrcast([*]u16, &tscBufferStop[timerId,0]),
+      @ptrcast([*]u16, &tscBufferStart[timerId,0]),
+      result
+    );
+  } else {
+    var tmp_stop = @constants(timerType, 0xFFFF);
+    subtract_timestamps(
+      &tmp_stop,
+      @ptrcast([*]u16, &tscBufferStart[timerId,0]),
+      result
+    );
+    add_timestamps(
+      result,
+      @ptrcast([*]u16, &tscBufferStop[timerId,0]),
+      result
+    );
+  }
+}
+
+fn elapsed_in_place(timerId: i16) void {
+  var result: timerType;
+  if (tscBufferStop[timerId,2] >= tscBufferStart[timerId,2]) {
+    subtract_timestamps(
+      @ptrcast([*]u16, &tscBufferStop[timerId,0]),
+      @ptrcast([*]u16, &tscBufferStart[timerId,0]),
+      &result
+    );
+  } else {
+    var tmp_stop = @constants(timerType, 0xFFFF);
+    subtract_timestamps(
+      &tmp_stop,
+      @ptrcast([*]u16, &tscBufferStart[timerId,0]),
+      &result
+    );
+    add_timestamps(
+      result,
+      @ptrcast([*]u16, &tscBufferStop[timerId,0]),
+      &result
+    );
+  }
+  result[0] = tscBufferStop[timerId,0];
+  result[1] = tscBufferStop[timerId,1];
+  result[2] = tscBufferStop[timerId,2];
+}
+
+
+fn accumulate_elapsed(timerId: i16, result: *timerType) void {
+  var tmp: timerType;
+  elapsed(timerId, &tmp);
+  add_timestamps(result, &tmp, result);
+}
+
+inline fn enable() void {
+  ts.enable_tsc();
+}
+
+inline fn disable() void {
+  ts.disable_tsc();
+}

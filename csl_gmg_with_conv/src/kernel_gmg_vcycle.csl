@@ -1,0 +1,1103 @@
+// Geometric Multigrid (GMG) V-cycle kernel with state machine
+// Implements full V-cycle on device without host intervention
+//-------------------------------------------------
+// PARAMETERS TO THIS MODULE
+//-------------------------------------------------
+
+// parameters
+param memcpyParams: comptime_struct;
+param reduceParams: comptime_struct;
+param stencilParams: comptime_struct;
+param MAX_ZDIM: i16;
+param BLOCK_SIZE: i16;
+param LEVELS: i16;
+param STATE: local_task_id;
+const MAX_ITERATIONS: i16 = 25;  // Reduced from 60 to save memory (160 bytes). 256³ converges in ~10 iters.
+
+//-------------------------------------------------
+// LIBRARIES and STATE MACHINE STATES
+//-------------------------------------------------
+const math_lib = @import_module("<math>");
+const sys_mod = @import_module( "<memcpy/memcpy>", memcpyParams);
+const timer = @import_module("timer_modified.csl", .{ .timerCount = 12 });
+const layout_mod = @import_module("<layout>");
+// simprint disabled — all calls are commented out, saves code+data if module has overhead
+// const simprint = @import_module("<simprint>", .{.enable = true});
+// const timestamp = @import_module("<time>");
+const reduce_mod = @import_module("./modified_csl_lib_hops/allreduce/pe.csl", @concat_structs(reduceParams, .{
+// const reduce_mod = @import_module("./modified_csl_lib/allreduce/pe.csl", @concat_structs(reduceParams, .{
+     .f_callback = f_trigger_state_machine,
+     .queues = [1]u16{2},
+     .dest_dsr_ids = [1]u16{1},
+     .src0_dsr_ids = [1]u16{1},
+     .src1_dsr_ids = [1]u16{1},
+     .MAX_PENCIL_DIM = MAX_ZDIM  // OPTIMIZATION: Pass MAX_ZDIM to size zero_buf dynamically, saves ~1KB for 256 problem
+     }));
+const stencil_mod = @import_module("./modified_csl_lib_hops/stencil_3d_7pts/pe.csl", @concat_structs(stencilParams, .{
+// const stencil_mod = @import_module("./modified_csl_lib/stencil_3d_7pts/pe.csl", @concat_structs(stencilParams, .{
+     .f_callback = f_trigger_state_machine,
+     .input_queues = [4]u16{4, 5, 6, 7},
+     .output_queues = if (@is_arch("wse3")) [4]u16{4, 5, 6, 7} else [1]u16{3},
+     .output_ut_id = 3,
+     .BLOCK_SIZE = BLOCK_SIZE,
+     .dest_dsr_ids = [2]u16{2,3},
+     .src0_dsr_ids = [1]u16{2},
+     .src1_dsr_ids = [2]u16{2,3}
+     }));
+
+// State definitions
+const STATE_INIT: i16 = 0;
+const STATE_DOWN_INIT: i16 = 1;
+const STATE_DOWN_SMOOTH_APPLY: i16 = 2;
+const STATE_DOWN_SMOOTH_UPDATE: i16 = 3;
+const STATE_DOWN_SMOOTH_CHECK: i16 = 4;
+const STATE_DOWN_RESIDUAL_APPLY: i16 = 5;
+const STATE_DOWN_RESIDUAL_COMPUTE: i16 = 6;
+const STATE_DOWN_RESTRICT_REDUCE: i16 = 7;
+const STATE_DOWN_RESTRICT_DIV: i16 = 8;
+const STATE_DOWN_LEVEL_CHECK: i16 = 9;
+const STATE_COARSE_INIT: i16 = 10;
+const STATE_COARSE_SMOOTH_APPLY: i16 = 11;
+const STATE_COARSE_SMOOTH_UPDATE: i16 = 12;
+const STATE_COARSE_SMOOTH_CHECK: i16 = 13;
+const STATE_UP_INIT: i16 = 14;
+const STATE_UP_EXPAND_Z: i16 = 15;
+const STATE_UP_BCAST: i16 = 16;
+const STATE_UP_INTERP_ADD: i16 = 17;
+const STATE_UP_SMOOTH_APPLY: i16 = 18;
+const STATE_UP_SMOOTH_UPDATE: i16 = 19;
+const STATE_UP_SMOOTH_CHECK: i16 = 20;
+const STATE_UP_LEVEL_CHECK: i16 = 21;
+const STATE_EXIT: i16 = 22;
+// UNUSED: const STATE_SYNC: i16 = 23;
+const STATE_CONV_CHECK: i16 = 23;  // Convergence check after V-cycle
+const STATE_CALC_RHO: i16 = 24;  // Calculate rho = |r|^2
+const STATE_RESIDUAL_AFTER_V_CYCLE_APPLY: i16 = 25;  // Apply operator after V-cycle to compute Au
+const STATE_RESIDUAL_AFTER_V_CYCLE_COMPUTE: i16 = 26;  // Compute residual after V-cycle
+const STATE_SYNC: i16 = 27;  // Sync all PEs by internal allreduce module
+
+
+// Timer identifiers
+const TIMER_ID_SMOOTH: i16 = 0;
+const TIMER_ID_RESIDUAL: i16 = 1;
+const TIMER_ID_RESTRICT: i16 = 2;
+const TIMER_ID_INTERP: i16 = 3;
+const TIMER_ID_TOTAL: i16 = 4;
+// Interpolation micro-benchmark timers (inside TIMER_ID_INTERP)
+const TIMER_ID_INTERP_EXPAND_Z: i16 = 5;
+const TIMER_ID_INTERP_BCAST: i16 = 6;
+const TIMER_ID_INTERP_ADD: i16 = 7;
+// Smoothing micro-benchmark timers (inside TIMER_ID_SMOOTH)
+const TIMER_ID_SMOOTH_APPLY: i16 = 8;   // f_apply_operator (stencil SPMV)
+const TIMER_ID_SMOOTH_UPDATE: i16 = 9;  // f_jacobi_smooth
+// Setup and convergence timers (to close the timing gap)
+const TIMER_ID_SETUP: i16 = 10;         // f_setup_level overhead
+const TIMER_ID_CONVERGENCE: i16 = 11;   // convergence check (SpMV + residual + allreduce at L0)
+
+
+
+//----------------------------------------------------//---------------------------------------------------
+// DATA on 48KB(variables, pointers, DSDs)
+//----------------------------------------------------//----------------------------------------------------
+
+// Compute total storage needed for GMG levels using geometric series formula
+// Total = zdim + zdim/2 + zdim/4 + ... + zdim/2^(LEVELS-1)
+// This function uses a comptime loop (like the identity matrix example)
+fn compute_total_gmg_size() i16 {
+    var total: i16 = 0;
+    var level: i16 = 0;
+
+    // geometric series: z + z/2 + z/4 + ... for LEVELS terms
+    while (level < LEVELS) : (level += 1) {
+        total += @as(i16, @as(u16, MAX_ZDIM) >> level);
+    }
+
+    return total;
+}
+
+// GMG data structures
+var u = @zeros([MAX_ZDIM]f32);
+var f = @zeros([MAX_ZDIM]f32);
+var r = @zeros([MAX_ZDIM]f32);
+var Au = @zeros([MAX_ZDIM]f32);
+const TOTAL_GMG_SIZE: i16 = compute_total_gmg_size();
+var save_u_smooth = @zeros([TOTAL_GMG_SIZE]f32);
+var save_f_down = @zeros([TOTAL_GMG_SIZE]f32);
+
+// Grid spacing array for each level (isotropic: hx=hy=hz, so single array)
+var hx_array = @zeros([LEVELS]f32);
+var jacobi_coeff_array = @zeros([LEVELS]f32);
+var jacobi_coeff_level: f32 = @as(f32, 0.0); // Cached per-level Jacobi coefficient (set in f_setup_level)
+const INV_RESTRICT_FACTOR: f32 = 1.0 / 8.0;  // 1/(2×2×2) for full coarsening
+var hx_level: f32 = @as(f32, 1.0);
+var stencil_coeff = @zeros([7]f32);
+
+// Timing buffers - store accumulated elapsed timestamps for each operation at each level
+const TIMER_ARRAY_SIZE: i16 = LEVELS * timer.tsc_size_words;
+// Main timers (always present): smooth, residual, restrict, interp, setup, convergence, total
+var timing_smooth = @zeros([TIMER_ARRAY_SIZE]u16);
+var timing_residual = @zeros([TIMER_ARRAY_SIZE]u16);
+var timing_restrict = @zeros([TIMER_ARRAY_SIZE]u16);
+var timing_interp = @zeros([TIMER_ARRAY_SIZE]u16);
+var timing_setup = @zeros([TIMER_ARRAY_SIZE]u16);
+var timing_convergence = @zeros([TIMER_ARRAY_SIZE]u16);
+var time_total_start_end_u16 = @zeros([timer.tsc_size_words]u16);
+
+// Micro-timers for detailed profiling (stencil/bcast sub-timings)
+var timing_smooth_apply = @zeros([TIMER_ARRAY_SIZE]u16);
+var timing_smooth_update = @zeros([TIMER_ARRAY_SIZE]u16);
+var timing_interp_expand_z = @zeros([TIMER_ARRAY_SIZE]u16);
+var timing_interp_bcast = @zeros([TIMER_ARRAY_SIZE]u16);
+var timing_bcast_configure = @zeros([TIMER_ARRAY_SIZE]u16);
+var timing_bcast_to_all = @zeros([TIMER_ARRAY_SIZE]u16);
+var timing_interp_add = @zeros([TIMER_ARRAY_SIZE]u16);
+var timing_spmv_total = @zeros([TIMER_ARRAY_SIZE]u16);
+var timing_spmv_communication = @zeros([TIMER_ARRAY_SIZE]u16);
+var timing_spmv_compute = @zeros([TIMER_ARRAY_SIZE]u16);
+
+// Operation counters (always present)
+var counter_smooth = @zeros([LEVELS]u32);
+var counter_residual = @zeros([LEVELS]u32);
+var counter_rho_check = @zeros([LEVELS]u32);
+var counter_restrict = @zeros([LEVELS]u32);
+var counter_interp = @zeros([LEVELS]u32);
+var counter_setup_init = @zeros([LEVELS]u32);
+
+// Roofline FLOP counters per level
+var count_fsub = @zeros([LEVELS]u32);
+var count_fmac = @zeros([LEVELS]u32);
+var count_fmul = @zeros([LEVELS]u32);
+var count_fadd = @zeros([LEVELS]u32);
+var count_fneg = @zeros([LEVELS]u32);
+var count_fmov_mem = @zeros([LEVELS]u32);
+var count_fmov_zero = @zeros([LEVELS]u32);
+var count_fmax = @zeros([LEVELS]u32);
+var count_fmov32 = @zeros([LEVELS]u32);
+
+
+// State machine parameters
+var dot = @zeros([1]f32); // dummy variable for f_sync
+var dummy_u32: u32 = 0;  // dummy counter for sync (not counted in roofline)
+// Convergence-check counter sink: SpMV + residual + allreduce MAX happen during
+// convergence diagnostic (excluded from time via wall-conv accounting). To keep
+// roofline FLOPs/bytes consistent with the "pure operators" time, we skip counter
+// increments during convergence. Library calls write to these dummy slots instead
+// of the real per-level counters. Separate vars avoid pointer-aliasing stalls.
+var in_convergence: bool = false;
+var dummy_count_fneg: u32 = 0;
+var dummy_count_fmac: u32 = 0;
+var dummy_count_fmov_zero: u32 = 0;
+var dummy_count_fmov32: u32 = 0;
+var dummy_count_fadd: u32 = 0;
+var dummy_count_fmax: u32 = 0;
+var n: i16 = 0;  // zDim
+var num_levels: i16 = 0;
+var pre_smooth_iter: i16 = 0;
+var post_smooth_iter: i16 = 0;
+var bottom_solver_iter: i16 = 0;
+var max_iter: i16 = 0;  // Maximum number of V-cycle iterations
+var tolerance: f32 = @as(f32, 0.0);  // Convergence tolerance
+// var rho: f32 = @as(f32, 0.0);  // L2 norm squared of residual (like PCG's xi)
+fn fill_rho() [1]f32 {
+    var rho = @zeros([1]f32);
+    rho[0] = @as(f32, 1000.0);
+    return rho;
+}
+var rho = fill_rho();
+var k: i16 = 0;  // Current iteration counter
+var rho_history = @zeros([MAX_ITERATIONS]f32);
+var factor: u16 = 1;
+var hops: u16 = 1;
+var restriction_window_width: u16 = 1;
+var restriction_window_height: u16 = 1; // local vars to init at each level
+var active_pes_in_restriction_window_x: u16 = 2;
+var active_pes_in_restriction_window_y: u16 = 2;
+const rectangle = @get_rectangle();
+const width: u16 = rectangle.width;
+const height: u16 = rectangle.height;
+var pe_id_x: u16 = 0;
+var pe_id_y: u16 = 0;
+var current_level_id: u16 = 0;
+var is_active_pe: bool = true;
+var current_level: i16 = 0;
+var current_smooth_iter: i16 = 0;
+var cur_state: i16 = 0;
+var next_state: i16 = 0;
+
+
+fn f_reset() void {
+    // GMG data structures
+    var index: i16 = 0;
+    while(index < MAX_ZDIM) : (index +=1) {
+        u[index] = 0.0;
+        f[index] = 0.0;
+        r[index] = 0.0;
+        Au[index] = 0.0;
+    }
+
+    index = 0;
+    while(index < TOTAL_GMG_SIZE) : (index +=1) {
+        save_u_smooth[index] = 0.0;
+        save_f_down[index] = 0.0;
+    }
+
+    // Grid spacing arrays for each level (passed from host)
+    index = 0;
+    while(index < LEVELS) : (index +=1) {
+        hx_array[index] = 0.0;
+        jacobi_coeff_array[index] = 0.0;
+    }
+    hx_level = @as(f32, 1.0);
+    index = 0;
+    while(index < 7) : (index +=1) {
+        stencil_coeff[index] = 0.0;
+    }
+   
+    index = 0;
+    while(index < LEVELS * timer.tsc_size_words) : (index +=1) {
+        timing_smooth[index] = 0;
+        timing_smooth_apply[index] = 0;
+        timing_smooth_update[index] = 0;
+        timing_residual[index] = 0;
+        timing_restrict[index] = 0;
+        timing_interp[index] = 0;
+        timing_interp_expand_z[index] = 0;
+        timing_interp_bcast[index] = 0;
+        timing_bcast_configure[index] = 0;
+        timing_bcast_to_all[index] = 0;
+        timing_interp_add[index] = 0;
+        timing_spmv_total[index] = 0;
+        timing_spmv_communication[index] = 0;
+        timing_spmv_compute[index] = 0;
+        timing_setup[index] = 0;
+        timing_convergence[index] = 0;
+        time_total_start_end_u16[index] = 0;
+    }
+
+
+    // // Operation counters - track number of operations at each level
+    index = 0;
+    while(index < LEVELS) : (index +=1) {
+        counter_smooth[index] = 0;
+        counter_residual[index] = 0;
+        counter_rho_check[index] = 0;
+        counter_restrict[index] = 0;
+        counter_interp[index] = 0;
+        counter_setup_init[index] = 0;
+        // Roofline counters
+        count_fsub[index] = 0;
+        count_fmac[index] = 0;
+        count_fmul[index] = 0;
+        count_fadd[index] = 0;
+        count_fneg[index] = 0;
+        count_fmov_mem[index] = 0;
+        count_fmov_zero[index] = 0;
+        count_fmax[index] = 0;
+        count_fmov32[index] = 0;
+    }
+
+
+    // State machine parameters
+    // dot = @zeros([1]f32); // dummy variable for f_sync
+    n = 0;  // zDim
+    num_levels = 0;
+    pre_smooth_iter = 0;
+    post_smooth_iter = 0;
+    bottom_solver_iter = 0;
+    max_iter = 0;  // Maximum number of V-cycle iterations
+    tolerance = @as(f32, 0.0);  // Convergence tolerance
+    // var rho: f32 = @as(f32, 0.0);  // L2 norm squared of residual (like PCG's xi)
+
+    // rho = fill_rho();
+    rho[0] = @as(f32, 1000.0);
+    k = 0;  // Current iteration counter
+    index = 0;
+    while(index < MAX_ITERATIONS) : (index +=1) {
+        rho_history[index] = 0.0;
+    }
+    // rho_history = @zeros([MAX_ITERATIONS]f32);
+    factor = 1;
+    hops = 1;
+    restriction_window_width = 1;
+    restriction_window_height = 1; // local vars to init at each level
+    active_pes_in_restriction_window_x = 2;
+    active_pes_in_restriction_window_y = 2;
+    pe_id_x = 0;
+    pe_id_y = 0;
+    current_level_id = 0;
+    is_active_pe = true;
+    current_level = 0;
+    current_smooth_iter = 0;
+    cur_state = 0;
+    next_state = 0;
+    in_convergence = false;
+
+    sys_mod.unblock_cmd_stream();
+}
+
+//----------------------------------------------------//---------------------------------------------------
+// DSDs AND POINTERS
+//----------------------------------------------------//---------------------------------------------------
+var mem_u_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> u[i] });
+var mem_f_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> f[i] });
+var mem_r_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> r[i] });
+var mem_Au_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> Au[i] });
+var mem_save_u_smooth_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> save_u_smooth[i] });
+var mem_save_f_down_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> save_f_down[i] });
+var mem_r_even_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> r[i] });
+var mem_r_odd_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> r[i] });
+var mem_f_coarse_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> f[i] });
+
+// data pointers
+var ptr_u: [*]f32 = &u;
+var ptr_f: [*]f32 = &f;
+var ptr_r: [*]f32 = &r;
+var ptr_hx_array: [*]f32 = &hx_array;
+var ptr_jacobi_coeff_array: [*]f32 = &jacobi_coeff_array;
+
+// timing pointers
+var ptr_timing_smooth: [*]u16 = &timing_smooth;
+var ptr_timing_smooth_apply: [*]u16 = &timing_smooth_apply;
+var ptr_timing_smooth_update: [*]u16 = &timing_smooth_update;
+var ptr_timing_residual: [*]u16 = &timing_residual;
+var ptr_timing_restrict: [*]u16 = &timing_restrict;
+var ptr_timing_interp: [*]u16 = &timing_interp;
+var ptr_timing_interp_expand_z: [*]u16 = &timing_interp_expand_z;
+var ptr_timing_interp_bcast: [*]u16 = &timing_interp_bcast;
+var ptr_timing_bcast_configure: [*]u16 = &timing_bcast_configure;
+var ptr_timing_bcast_to_all: [*]u16 = &timing_bcast_to_all;
+var ptr_timing_interp_add: [*]u16 = &timing_interp_add;
+var ptr_time_total_start_end: [*]u16 = &time_total_start_end_u16;
+var ptr_timing_spmv_total: [*]u16 = &timing_spmv_total;
+var ptr_timing_spmv_communication: [*]u16 = &timing_spmv_communication;
+var ptr_timing_spmv_compute: [*]u16 = &timing_spmv_compute;
+var ptr_timing_setup: [*]u16 = &timing_setup;
+var ptr_timing_convergence: [*]u16 = &timing_convergence;
+
+// counter pointers
+var ptr_counter_smooth: [*]u32 = &counter_smooth;
+var ptr_counter_residual: [*]u32 = &counter_residual;
+var ptr_counter_restrict: [*]u32 = &counter_restrict;
+var ptr_counter_interp: [*]u32 = &counter_interp;
+var ptr_counter_setup_init: [*]u32 = &counter_setup_init;
+var ptr_counter_rho_check: [*]u32 = &counter_rho_check;
+var ptr_rho_history: [*]f32 = &rho_history;
+// Roofline counter pointers
+var ptr_count_fsub: [*]u32 = &count_fsub;
+var ptr_count_fmac: [*]u32 = &count_fmac;
+var ptr_count_fmul: [*]u32 = &count_fmul;
+var ptr_count_fadd: [*]u32 = &count_fadd;
+var ptr_count_fneg: [*]u32 = &count_fneg;
+var ptr_count_fmov_mem: [*]u32 = &count_fmov_mem;
+var ptr_count_fmov_zero: [*]u32 = &count_fmov_zero;
+var ptr_count_fmax: [*]u32 = &count_fmax;
+var ptr_count_fmov32: [*]u32 = &count_fmov32;
+// var ptr_rho: [*]f32 = &rho;
+
+//----------------------------------------------------//---------------------------------------------------
+//-------------------------------------------------
+// HELPER FUNCTIONS
+//-------------------------------------------------
+// Helper functions
+fn isActivePE(px: i16, py: i16, factor_val: u16) bool {
+    // factor is always a power of 2, so use bitmask instead of modulo (saves __modsi3)
+    const mask: i16 = @as(i16, factor_val) - 1;
+    return (px & mask) == 0 and (py & mask) == 0;
+}
+
+fn is_top_left_of_restriction_window(px: u16, py: u16, window_width: u16, window_height: u16) bool {
+    // window_width/height are always powers of 2, so use bitmask
+    return (px & (window_width - 1)) == 0 and (py & (window_height - 1)) == 0;
+}
+
+// ------------------------------------------------
+// TIMER HELPER FUNCTIONS
+// ------------------------------------------------
+
+// Enable timing
+fn f_enable_timer() void {
+    // stencil_mod.enable_timer();
+    timer.enable();
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_tic_total() void {
+    timer.start(TIMER_ID_TOTAL);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_toc_total() void {
+    timer.stop(TIMER_ID_TOTAL);
+    timer.elapsed(TIMER_ID_TOTAL, @ptrcast(*[timer.tsc_size_words]u16, &time_total_start_end_u16));
+    sys_mod.unblock_cmd_stream();
+}
+
+// Timing helper functions
+fn save_timestamp_start(timer_id: i16) void {
+    timer.start(timer_id);
+}
+
+fn save_timestamp_end(level: i16, timing_array: [*]u16, timer_id: i16) void {
+    timer.stop(timer_id);
+    const offset: i16 = level * timer.tsc_size_words;
+    timer.accumulate_elapsed(timer_id, @ptrcast(*[timer.tsc_size_words]u16, &timing_array[offset]));
+}
+//-------------------------------------------------
+// GMG KERNELS
+//-------------------------------------------------
+
+// Apply operator for Jacobi smoothing.
+// During convergence, counters are written to dummy slots (not part of roofline).
+fn f_apply_operator() void {
+    // spmv zeros y internally before accumulating — no need to zero Au here
+    if (in_convergence) {
+        stencil_mod.spmv(n, &stencil_coeff, &u, &Au, current_level,
+            &timing_spmv_total, &timing_spmv_communication, &timing_spmv_compute,
+            &dummy_count_fneg, &dummy_count_fmac, &dummy_count_fmov_zero, &dummy_count_fmov32);
+    } else {
+        stencil_mod.spmv(n, &stencil_coeff, &u, &Au, current_level,
+            &timing_spmv_total, &timing_spmv_communication, &timing_spmv_compute,
+            &count_fneg[current_level], &count_fmac[current_level],
+            &count_fmov_zero[current_level], &count_fmov32[current_level]);
+    }
+}
+
+// Jacobi smoothing: u = u + JACOBI_COEFF * (f - Au)
+fn f_jacobi_smooth() void {
+    counter_smooth[current_level] += 1;
+    // jacobi_coeff_level is cached per level in f_setup_level
+    if (is_active_pe) {
+        @fsubs(mem_r_dsd, mem_f_dsd, mem_Au_dsd);
+        @fmacs(mem_u_dsd, mem_u_dsd, mem_r_dsd, jacobi_coeff_level);
+        count_fsub[current_level] += @as(u32, n);
+        count_fmac[current_level] += @as(u32, n);
+    } else {
+        @fmovs(mem_u_dsd, 0.0);                                // zero-fill u (inactive)
+        count_fmov_zero[current_level] += @as(u32, n);
+    }
+    // save_u_smooth moved to STATE_DOWN_SMOOTH_CHECK (only needed once after last pre-smooth iter)
+}
+
+// Calculate residual: r = f - Au.
+// During convergence, skip counter updates (not part of roofline).
+fn f_residual() void {
+    counter_residual[current_level] += 1;
+    if (is_active_pe) {
+        @fsubs(mem_r_dsd, mem_f_dsd, mem_Au_dsd);
+        if (!in_convergence) {
+            count_fsub[current_level] += @as(u32, n);
+        }
+    } else {
+        @fmovs(mem_r_dsd, 0.0);                                // zero-fill r (inactive)
+        if (!in_convergence) {
+            count_fmov_zero[current_level] += @as(u32, n);
+        }
+    }
+}
+
+// Calculate rho: rho = ||r||_inf at level 0 (for convergence checking).
+// Each PE holds a z-pencil; find local max|r[i]| then global max across PEs.
+// This ONLY runs during convergence — counters always go to dummy slots.
+fn f_compute_rho() void {
+        // Local max over ALL z-elements on this PE
+        rho[0] = 0.0;
+        var i: i16 = 0;
+        while (i < n) : (i += 1) {
+            const abs_val = math_lib.abs(r[i]);
+            if (abs_val > rho[0]) {
+                rho[0] = abs_val;
+            }
+        }
+        // Global max across all PEs
+        reduce_mod.setCounterPtrs(&dummy_count_fadd, &dummy_count_fmax, &dummy_count_fmov_zero, &dummy_count_fmov32);
+        reduce_mod.allreduce(1, &rho, reduce_mod.TYPE_BINARY_OP.MAX);
+}
+
+// Restrict the window into top left PE.
+fn f_reduce_row_col_top_left() void {
+    reduce_mod.setCounterPtrs(&count_fadd[current_level], &count_fmax[current_level], &count_fmov_zero[current_level], &count_fmov32[current_level]);
+    reduce_mod.reduce_row_col_top_left(n, &r, reduce_mod.TYPE_BINARY_OP.ADD);
+}
+
+// Restriction: divide the window into 2x2x2 blocks and sum the pairs in z dimension.
+// TODO: OPTIMIZEME - use registers like dsrs
+fn f_restriction_division() void {
+    counter_restrict[current_level] += 1;
+
+    if (is_top_left_of_restriction_window(pe_id_x, pe_id_y, 
+        restriction_window_width, restriction_window_height)) {
+        // Full coarsening: sum pairs in z dimension after x,y averaging
+        // Fine level z dimension is n, coarse level z dimension is n/2
+        const coarse_n: i16 = n >> 1;  // Coarse z dimension
+        
+        // Create strided DSDs to access pairs in z: (0,1), (2,3), (4,5), (6,7), ...
+        // DSD for even indices: 0, 2, 4, 6, ... (stride 2, starting at offset 0)
+        mem_r_even_dsd = @set_dsd_base_addr(mem_r_even_dsd, &r);
+        mem_r_even_dsd = @set_dsd_length(mem_r_even_dsd, @bitcast(u16, coarse_n));
+        mem_r_even_dsd = @set_dsd_stride(mem_r_even_dsd, 2);  // Access 0, 2, 4, 6, ...
+        
+        // DSD for odd indices: 1, 3, 5, 7, ... (stride 2, starting at offset 1)
+        mem_r_odd_dsd = @set_dsd_base_addr(mem_r_odd_dsd, &r);
+        mem_r_odd_dsd = @increment_dsd_offset(mem_r_odd_dsd, 1, f32);  // Start at index 1
+        mem_r_odd_dsd = @set_dsd_length(mem_r_odd_dsd, @bitcast(u16, coarse_n));
+        mem_r_odd_dsd = @set_dsd_stride(mem_r_odd_dsd, 2);  // Access 1, 3, 5, 7, ...
+        
+        // Set mem_f_dsd to coarse z dimension (n/2)
+        mem_f_coarse_dsd = @set_dsd_base_addr(mem_f_coarse_dsd, &f);
+        mem_f_coarse_dsd = @set_dsd_length(mem_f_coarse_dsd, @bitcast(u16, coarse_n));
+        
+        // Sum pairs in z: f[coarse_idx] = (r[2*coarse_idx] + r[2*coarse_idx+1]) / 8
+        @fadds(mem_f_coarse_dsd, mem_r_even_dsd, mem_r_odd_dsd);  // f_coarse = even + odd (no intermediate copy)
+        @fmuls(mem_f_coarse_dsd, mem_f_coarse_dsd, INV_RESTRICT_FACTOR);
+        @fmovs(mem_f_dsd, mem_f_coarse_dsd);
+
+        count_fadd[current_level] += @as(u32, coarse_n);
+        count_fmul[current_level] += @as(u32, coarse_n);
+        count_fmov_mem[current_level] += @as(u32, coarse_n);   // copy f_coarse→f
+    } else {
+        @fmovs(mem_f_dsd, 0.0);
+        count_fmov_zero[current_level] += @as(u32, n);
+    }
+
+}
+
+// TODO: OPTIMIZEME - use registers like dsrs
+fn f_interpolation_expand_z() void {
+    // Interpolation: duplicate each coarse element to 2 fine elements
+    // Reverse of restriction: if restriction sums pairs (0,1)->0, (2,3)->1, ...
+    // Then interpolation duplicates: 0->(0,1), 1->(2,3), ...
+    // Coarse z dimension is n/2, fine z dimension is n
+    const coarse_n: i16 = n >> 1;  // Coarse z dimension
+    
+    // Save coarse values temporarily in r (first coarse_n elements)
+    // r is safe to use here: it's set to 0 in f_setup_level() and not used until
+    // STATE_RESIDUAL_AFTER_V_CYCLE_COMPUTE, which is much later in the state machine
+    var mem_u_coarse_dsd = @set_dsd_base_addr(mem_u_dsd, &u);
+    mem_u_coarse_dsd = @set_dsd_length(mem_u_coarse_dsd, @bitcast(u16, coarse_n));
+    var mem_r_coarse_dsd = @set_dsd_base_addr(mem_r_dsd, &r);
+    mem_r_coarse_dsd = @set_dsd_length(mem_r_coarse_dsd, @bitcast(u16, coarse_n));
+    @fmovs(mem_r_coarse_dsd, mem_u_coarse_dsd);  // Save coarse values
+
+    // Create strided DSDs to write to even and odd positions
+    var mem_u_even_dsd = @set_dsd_base_addr(mem_u_dsd, &u);
+    mem_u_even_dsd = @set_dsd_length(mem_u_even_dsd, @bitcast(u16, coarse_n));
+    mem_u_even_dsd = @set_dsd_stride(mem_u_even_dsd, 2);
+
+    var mem_u_odd_dsd = @set_dsd_base_addr(mem_u_dsd, &u);
+    mem_u_odd_dsd = @increment_dsd_offset(mem_u_odd_dsd, 1, f32);
+    mem_u_odd_dsd = @set_dsd_length(mem_u_odd_dsd, @bitcast(u16, coarse_n));
+    mem_u_odd_dsd = @set_dsd_stride(mem_u_odd_dsd, 2);
+
+    @fmovs(mem_u_even_dsd, mem_r_coarse_dsd);
+    @fmovs(mem_u_odd_dsd, mem_r_coarse_dsd);
+    count_fmov_mem[current_level] += @as(u32, coarse_n) * 3;  // save + even + odd (all mem→mem)
+    
+    // Now u has fine z dimension n with duplicated values
+    // Update mem_u_dsd to reflect fine z dimension (n)
+    mem_u_dsd = @set_dsd_length(mem_u_dsd, @bitcast(u16, n));
+
+}
+
+// Interpolation: u = u + u_smooth only on active PEs.
+fn f_interpolation_add() void {
+    counter_interp[current_level] += 1;
+    if (is_active_pe) {
+        @fadds(mem_u_dsd, mem_u_dsd, mem_save_u_smooth_dsd);
+        count_fadd[current_level] += @as(u32, n);
+    } else {
+        @fmovs(mem_u_dsd, 0.0);
+        count_fmov_zero[current_level] += @as(u32, n);
+    }
+}
+
+// Broadcast the coarse solution to all fine points in the window.
+fn f_bcast_from_top_left() void {
+    reduce_mod.setCounterPtrs(&count_fadd[current_level], &count_fmax[current_level], &count_fmov_zero[current_level], &count_fmov32[current_level]);
+    reduce_mod.broadcast_from_top_left(n, &u, current_level, &timing_bcast_configure, &timing_bcast_to_all);
+}
+
+// Setup the hops based spmv and restriction parameters.
+fn f_init_spmv_and_reduce(level_id: u16) void {
+    
+    factor = @as(u16, 1) << level_id;
+    hops = factor;
+    is_active_pe = isActivePE(@as(i16, pe_id_x), @as(i16, pe_id_y), factor);
+    stencil_mod.setHopBasedParams(hops, factor, width, height);
+
+    restriction_window_width = @as(u16, 1) << (level_id + 1);
+    restriction_window_height = @as(u16, 1) << (level_id + 1);    
+    const window_w = @as(i16, restriction_window_width);
+    const window_h = @as(i16, restriction_window_height);
+    reduce_mod.setWindowedReductionParams(window_w, window_h, factor, 
+        active_pes_in_restriction_window_x, active_pes_in_restriction_window_y, level_id);
+}
+
+// Setup the level parameters.
+fn f_setup_level(level_id: u16, down: i16) void {
+    save_timestamp_start(TIMER_ID_SETUP);
+    counter_setup_init[current_level] += 1;
+
+    n = @as(i16, @as(u16, MAX_ZDIM) >> level_id);    // zdim/1 --> zdim/2 --> zdim/4 --> ...
+    current_level_id = level_id;
+    hx_level = hx_array[level_id]; // hx_array stores 1/hx (reciprocal, computed on host)
+    jacobi_coeff_level = jacobi_coeff_array[level_id]; // Cache for f_jacobi_smooth
+    // Update stencil coefficients — hx_level is 1/hx, so inv_hx_sq = hx_level²
+    const inv_hx_sq: f32 = hx_level * hx_level;
+    const center_coeff: f32 = -6.0 * inv_hx_sq;  // -2*(1/h² + 1/h² + 1/h²) = -6/h²
+    var neigh_coeff: f32 = inv_hx_sq;
+    stencil_coeff[0] = neigh_coeff;
+    stencil_coeff[1] = neigh_coeff;
+    stencil_coeff[2] = neigh_coeff;
+    stencil_coeff[3] = neigh_coeff;
+    stencil_coeff[4] = neigh_coeff;
+    stencil_coeff[5] = neigh_coeff;
+    stencil_coeff[6] = center_coeff;
+    
+
+    // DSD
+    // Setup save arrays - compute offset as sum of sizes of all previous levels
+    // This implements the geometric series: zdim + zdim/2 + zdim/4 + ...
+    var start_idx: i16 = 0;
+    var temp_level: u16 = 0;
+    // Using right-shifts instead of division.
+    while (temp_level < current_level_id) : (temp_level += 1) {
+        start_idx += @as(i16, @as(u16, MAX_ZDIM) >> temp_level);    // sums up the index as per the data structure used
+    }
+    
+    mem_save_u_smooth_dsd = @set_dsd_base_addr(mem_save_u_smooth_dsd, &save_u_smooth);
+    mem_save_u_smooth_dsd = @increment_dsd_offset(mem_save_u_smooth_dsd, start_idx, f32);
+    mem_save_u_smooth_dsd = @set_dsd_length(mem_save_u_smooth_dsd, @bitcast(u16, n));
+    
+    mem_save_f_down_dsd = @set_dsd_base_addr(mem_save_f_down_dsd, &save_f_down);
+    mem_save_f_down_dsd = @increment_dsd_offset(mem_save_f_down_dsd, start_idx, f32);
+    mem_save_f_down_dsd = @set_dsd_length(mem_save_f_down_dsd, @bitcast(u16, n));
+
+    mem_u_dsd = @set_dsd_length(mem_u_dsd, @bitcast(u16, n));
+    mem_f_dsd = @set_dsd_length(mem_f_dsd, @bitcast(u16, n));
+    mem_r_dsd = @set_dsd_length(mem_r_dsd, @bitcast(u16, n));
+    mem_Au_dsd = @set_dsd_length(mem_Au_dsd, @bitcast(u16, n));
+    
+    f_init_spmv_and_reduce(current_level_id);
+    
+    // SAVE AND RESTORE — fmovs are executed unconditionally, but counters are
+    // gated by in_convergence (setup runs during conv diagnostic at level 0).
+    if (down == 1) {
+        if (level_id != 0) {
+            @fmovs(mem_u_dsd, 0.0);                                    // zero-fill u
+            if (!in_convergence) {
+                count_fmov_zero[current_level] += @as(u32, n);
+            }
+        }
+        if (level_id == 0 and k > 0) {
+            @fmovs(mem_f_dsd, mem_save_f_down_dsd);                    // restore f (mem→mem)
+            if (!in_convergence) {
+                count_fmov_mem[current_level] += @as(u32, n);
+            }
+        }
+        @fmovs(mem_save_f_down_dsd, mem_f_dsd);                        // save f (mem→mem)
+        if (!in_convergence) {
+            count_fmov_mem[current_level] += @as(u32, n);
+        }
+    } else {
+        @fmovs(mem_f_dsd, mem_save_f_down_dsd);                        // restore f (mem→mem)
+        if (!in_convergence) {
+            count_fmov_mem[current_level] += @as(u32, n);
+        }
+    }
+
+    @fmovs(mem_r_dsd, 0.0);                                            // zero-fill r
+    if (!in_convergence) {
+        count_fmov_zero[current_level] += @as(u32, n);
+    }
+
+    save_timestamp_end(current_level, &timing_setup, TIMER_ID_SETUP);
+}
+
+// ------------------------------------------------
+// ENTRY POINTS KERNELs
+// ------------------------------------------------
+// Synchronize all PEs using allreduce (also captures reference clock)
+fn f_sync() void {
+    cur_state = STATE_SYNC;
+    @activate(STATE);
+}
+
+// Main V-cycle entry point
+fn f_gmg_vcycle(levels: i16, pre_iter: i16, post_iter: i16, bottom_iter: i16, max_iter_val: i16, tol: f32) void {
+
+    // f_tic_total();
+    num_levels = levels;
+    pre_smooth_iter = pre_iter;
+    post_smooth_iter = post_iter;
+    bottom_solver_iter = bottom_iter;
+    max_iter = max_iter_val;
+    tolerance = tol;
+    k = 0;  // Reset iteration counter
+    pe_id_x = layout_mod.get_x_coord();
+    pe_id_y = layout_mod.get_y_coord();
+    
+    current_level = 0;
+    cur_state = STATE_INIT;
+    @activate(STATE);
+}
+
+// ------------------------------------------------
+// STATE MACHINE
+// ------------------------------------------------
+fn f_trigger_state_machine() void {
+    if (STATE_UP_BCAST == cur_state) {
+        save_timestamp_end(current_level, &timing_interp_bcast, TIMER_ID_INTERP_BCAST);
+    }
+    // Smooth micro-benchmark: apply (SPMV) completes async, record when callback fires
+    if (STATE_DOWN_SMOOTH_APPLY == cur_state or STATE_UP_SMOOTH_APPLY == cur_state or STATE_COARSE_SMOOTH_APPLY == cur_state) {
+        save_timestamp_end(current_level, &timing_smooth_apply, TIMER_ID_SMOOTH_APPLY);
+    }
+    cur_state = next_state;
+    @activate(STATE);
+}
+
+task f_state() void {
+    if (STATE_SYNC == cur_state) {
+        // sync all PEs — counters get reset by f_reset() before actual measurement
+        next_state = STATE_EXIT;
+        reduce_mod.setCounterPtrs(&count_fadd[0], &count_fmax[0], &count_fmov_zero[0], &count_fmov32[0]);
+        reduce_mod.allreduce(1, &dot, reduce_mod.TYPE_BINARY_OP.ADD);
+    }
+    else if (STATE_INIT == cur_state) {
+        // Start down cycle at level 0
+        current_level = 0;
+        next_state = STATE_DOWN_INIT;
+        f_trigger_state_machine();
+    }
+    // ------------------------------------------------
+    // DOWN CYCLE
+    // ------------------------------------------------
+    else if (STATE_DOWN_INIT == cur_state) {
+        // Initialize current level
+        f_setup_level(@as(u16, current_level), 1); // (.. , down=True/False)
+        current_smooth_iter = 0;
+        next_state = STATE_DOWN_SMOOTH_APPLY;
+        f_trigger_state_machine();
+        
+    } else if (STATE_DOWN_SMOOTH_APPLY == cur_state) {
+
+        // Apply operator for Jacobi smoothing
+        // Start timing for DOWN smooth (first iteration only)
+        if (current_smooth_iter == 0) {
+            save_timestamp_start(TIMER_ID_SMOOTH);
+        }
+        save_timestamp_start(TIMER_ID_SMOOTH_APPLY);
+        next_state = STATE_DOWN_SMOOTH_UPDATE;
+        f_apply_operator();
+
+    } else if (STATE_DOWN_SMOOTH_UPDATE == cur_state) {
+        save_timestamp_start(TIMER_ID_SMOOTH_UPDATE);
+        f_jacobi_smooth();
+        save_timestamp_end(current_level, &timing_smooth_update, TIMER_ID_SMOOTH_UPDATE);
+        current_smooth_iter = current_smooth_iter + 1;
+        next_state = STATE_DOWN_SMOOTH_CHECK;
+        f_trigger_state_machine();
+        
+    } else if (STATE_DOWN_SMOOTH_CHECK == cur_state) {
+        if (current_smooth_iter < pre_smooth_iter) {
+            next_state = STATE_DOWN_SMOOTH_APPLY;
+        } else {
+            // End timing for DOWN smoothing
+            save_timestamp_end(current_level, &timing_smooth, TIMER_ID_SMOOTH);
+            // Save u for interpolation — only once after last pre-smooth iteration
+            @fmovs(mem_save_u_smooth_dsd, mem_u_dsd);
+            count_fmov_mem[current_level] += @as(u32, n);
+            next_state = STATE_DOWN_RESIDUAL_APPLY;
+        }
+        f_trigger_state_machine();
+
+    } else if (STATE_DOWN_RESIDUAL_APPLY == cur_state) {
+        // Apply operator for residual
+        save_timestamp_start(TIMER_ID_RESIDUAL);
+        next_state = STATE_DOWN_RESIDUAL_COMPUTE;
+        f_apply_operator();
+        
+    } else if (STATE_DOWN_RESIDUAL_COMPUTE == cur_state) {
+        // Compute residual
+        f_residual();
+        save_timestamp_end(current_level, &timing_residual, TIMER_ID_RESIDUAL);
+        next_state = STATE_DOWN_RESTRICT_REDUCE;
+        f_trigger_state_machine();
+        
+    } else if (STATE_DOWN_RESTRICT_REDUCE == cur_state) {
+        // Restriction: reduce to top-left
+        save_timestamp_start(TIMER_ID_RESTRICT);
+        next_state = STATE_DOWN_RESTRICT_DIV;
+        f_reduce_row_col_top_left();
+        
+    } else if (STATE_DOWN_RESTRICT_DIV == cur_state) {
+        // Restriction: divide by number of active PEs
+        f_restriction_division();
+        save_timestamp_end(current_level, &timing_restrict, TIMER_ID_RESTRICT);
+        next_state = STATE_DOWN_LEVEL_CHECK;
+        f_trigger_state_machine();
+        
+    } else if (STATE_DOWN_LEVEL_CHECK == cur_state) {
+        current_level = current_level + 1;
+        if (current_level < num_levels - 1) {   // (coarsest - 1) level
+            next_state = STATE_DOWN_INIT;
+        } else {
+            next_state = STATE_COARSE_INIT;
+        }
+        f_trigger_state_machine();
+        
+    } 
+    // ------------------------------------------------
+    // COARSE LEVEL
+    // ------------------------------------------------
+    else if (STATE_COARSE_INIT == cur_state) {
+        // Initialize coarsest level
+        f_setup_level(@as(u16, current_level), 1);
+        current_smooth_iter = 0;
+        next_state = STATE_COARSE_SMOOTH_APPLY;
+        f_trigger_state_machine();
+        
+    } else if (STATE_COARSE_SMOOTH_APPLY == cur_state) {
+        // Start timing for coarse solve (use down array, first iteration only)
+        if (current_smooth_iter == 0) {
+            save_timestamp_start(TIMER_ID_SMOOTH);
+        }
+        save_timestamp_start(TIMER_ID_SMOOTH_APPLY);
+        next_state = STATE_COARSE_SMOOTH_UPDATE;
+        f_apply_operator();
+
+    } else if (STATE_COARSE_SMOOTH_UPDATE == cur_state) {
+        save_timestamp_start(TIMER_ID_SMOOTH_UPDATE);
+        f_jacobi_smooth();
+        save_timestamp_end(current_level, &timing_smooth_update, TIMER_ID_SMOOTH_UPDATE);
+        current_smooth_iter = current_smooth_iter + 1;
+        next_state = STATE_COARSE_SMOOTH_CHECK;
+        f_trigger_state_machine();
+        
+    } else if (STATE_COARSE_SMOOTH_CHECK == cur_state) {
+        if (current_smooth_iter < bottom_solver_iter) {
+            next_state = STATE_COARSE_SMOOTH_APPLY;
+        } else {
+            save_timestamp_end(current_level, &timing_smooth, TIMER_ID_SMOOTH);
+            // Start up cycle
+            current_level = current_level - 1;
+            next_state = STATE_UP_INIT;
+            // print_time_debug();
+        }
+        f_trigger_state_machine();
+        
+    }
+    // ------------------------------------------------
+    // UP CYCLE
+    // ------------------------------------------------
+    else if (STATE_UP_INIT == cur_state) {
+        // Initialize level for up cycle
+        f_setup_level(@as(u16, current_level), 0); // (.. , down=False for up cycle)
+        next_state = STATE_UP_EXPAND_Z;
+        f_trigger_state_machine();
+        
+    } else if (STATE_UP_EXPAND_Z == cur_state) {
+        // Expand z dimension: duplicate each coarse element to 2 fine elements
+        // This prepares u for broadcasting (u currently has coarse z dim, needs fine z dim)
+        save_timestamp_start(TIMER_ID_INTERP);
+        save_timestamp_start(TIMER_ID_INTERP_EXPAND_Z);
+        f_interpolation_expand_z();
+        save_timestamp_end(current_level, &timing_interp_expand_z, TIMER_ID_INTERP_EXPAND_Z);
+        next_state = STATE_UP_BCAST;
+        f_trigger_state_machine();
+        
+    } else if (STATE_UP_BCAST == cur_state) {
+        // Broadcast from top-left (async - callback runs when done)
+        save_timestamp_start(TIMER_ID_INTERP_BCAST);
+        next_state = STATE_UP_INTERP_ADD;
+        f_bcast_from_top_left();
+        
+    } else if (STATE_UP_INTERP_ADD == cur_state) {
+        // Add interpolated correction
+        save_timestamp_start(TIMER_ID_INTERP_ADD);
+        f_interpolation_add();
+        save_timestamp_end(current_level, &timing_interp_add, TIMER_ID_INTERP_ADD);
+        save_timestamp_end(current_level, &timing_interp, TIMER_ID_INTERP);
+        current_smooth_iter = 0;
+        next_state = STATE_UP_SMOOTH_APPLY;
+        f_trigger_state_machine();
+        
+    } else if (STATE_UP_SMOOTH_APPLY == cur_state) {
+        // Start timing for UP smooth (first iteration only)
+        if (current_smooth_iter == 0) {
+            save_timestamp_start(TIMER_ID_SMOOTH);
+        }
+        save_timestamp_start(TIMER_ID_SMOOTH_APPLY);
+        next_state = STATE_UP_SMOOTH_UPDATE;
+        f_apply_operator();
+
+    } else if (STATE_UP_SMOOTH_UPDATE == cur_state) {
+        save_timestamp_start(TIMER_ID_SMOOTH_UPDATE);
+        f_jacobi_smooth();
+        save_timestamp_end(current_level, &timing_smooth_update, TIMER_ID_SMOOTH_UPDATE);
+        current_smooth_iter = current_smooth_iter + 1;
+        next_state = STATE_UP_SMOOTH_CHECK;
+        f_trigger_state_machine();
+        
+    } else if (STATE_UP_SMOOTH_CHECK == cur_state) {    // post-smooth iterations loop
+        if (current_smooth_iter < post_smooth_iter) {
+            next_state = STATE_UP_SMOOTH_APPLY;
+        } else {
+            // End timing for UP smoothing
+            save_timestamp_end(current_level, &timing_smooth, TIMER_ID_SMOOTH);
+            next_state = STATE_UP_LEVEL_CHECK;
+        }
+        f_trigger_state_machine();
+        
+    } else if (STATE_UP_LEVEL_CHECK == cur_state) {
+        current_level = current_level - 1;
+        if (current_level >= 0) {
+            next_state = STATE_UP_INIT;
+        } else {
+            // V-cycle complete, need to compute residual at level 0 for convergence checking
+            // Set current_level back to 0 and compute residual
+            current_level = 0;
+            next_state = STATE_RESIDUAL_AFTER_V_CYCLE_APPLY;
+        }
+        f_trigger_state_machine();
+        
+    } else if (STATE_RESIDUAL_AFTER_V_CYCLE_APPLY == cur_state) {
+        // After V-cycle: restore level 0 context and apply operator to compute Au
+        // CRITICAL: Must restore level 0 context to ensure:
+        // 1. f is restored to original RHS from save_f_down
+        // 2. DSD lengths (n) are correct for level 0
+        // 3. Stencil coefficients are correct for level 0
+        save_timestamp_start(TIMER_ID_CONVERGENCE);
+        // Gate ALL counter updates for convergence-check path: f_setup_level
+        // (fmov_mem restore + fmov_zero r), f_apply_operator (SpMV),
+        // f_residual (fsubs), f_compute_rho (allreduce MAX). Diagnostic is
+        // excluded from both time (wall - conv) and counters (roofline).
+        in_convergence = true;
+        f_setup_level(@as(u16, current_level), 0); // down=False, restores f from save_f_down
+        next_state = STATE_RESIDUAL_AFTER_V_CYCLE_COMPUTE;
+
+        f_apply_operator();
+        
+    } else if (STATE_RESIDUAL_AFTER_V_CYCLE_COMPUTE == cur_state) {
+        // Compute residual r = f - Au at level 0
+        // At this point, f should be the original RHS (restored by f_setup_level)
+        counter_residual[current_level] -= 1;       // Adjust the counter as we count the final residual check for RHO as seperate and not in residual computation
+        f_residual();
+        next_state = STATE_CALC_RHO;
+        f_trigger_state_machine();
+        
+    } else if (STATE_CALC_RHO == cur_state) {
+        // Compute rho = max(r) at level 0
+        next_state = STATE_CONV_CHECK;
+        f_compute_rho();    // internally has the library which triggers the state machine.
+
+    } else if (STATE_CONV_CHECK == cur_state) {
+        // Store rho[0] in history array for host reading
+        if (k < MAX_ITERATIONS) {
+            rho_history[k] = rho[0];
+        }
+        // Compute rho = max(r)
+        // if max(r) < tol, then exit
+        // if (rho > tolerance) and (k < max_iter), continue
+        // This matches the Python implementation: while (xi_max > self.rel_tolerance) and (iterations < max_iter)
+        save_timestamp_end(current_level, &timing_convergence, TIMER_ID_CONVERGENCE);
+        in_convergence = false;  // back to pure V-cycle operators for next iteration
+        k = k + 1;
+        // After first V-cycle (k transitions 0→1), stop all roofline measurement.
+        // Subsequent iterations run without timer/counter overhead.
+        if ((rho[0] > tolerance) and (k < max_iter)) {
+            // Not converged and iterations remaining: increment counter and start next V-cycle
+            next_state = STATE_INIT;
+        } else {
+            // Converged or max iterations reached: exit
+            next_state = STATE_EXIT;
+
+        }
+        counter_rho_check[current_level] += 1;
+        // print_time_debug();
+        f_trigger_state_machine();
+        
+    }
+    // ------------------------------------------------
+    // EXIT
+    // ------------------------------------------------    
+    else if (STATE_EXIT == cur_state) {
+        // save_timestamp_end(current_level, &time_total_start_end_u16, TIMER_ID_TOTAL);
+        // simprint.fmt_with_coords("TIMING_DEBUG: timing_residual=[{d},{d},{d}]", .{@as(u16, timing_residual[0]), @as(u16, timing_residual[1]), @as(u16, timing_residual[2])});
+        sys_mod.unblock_cmd_stream();
+        
+    } else {
+        @assert(false); // Error: unknown state
+        // assert() is ignored by HW, it could hang here
+        // To avoid a stall, trigger callback (the caveat is the wrong result)
+        sys_mod.unblock_cmd_stream();
+    }
+}
+
+// ------------------------------------------------
+// EXPORT SYMBOLS
+// ------------------------------------------------
+comptime {
+    @bind_local_task(f_state, STATE);
+}
+
+comptime {
+    // data
+    @export_symbol(ptr_u, "u");
+    @export_symbol(ptr_f, "f");
+    @export_symbol(ptr_r, "r");
+    @export_symbol(ptr_hx_array, "hx_array");
+    // hy_array, hz_array removed — isotropic grid uses hx_array only
+    @export_symbol(ptr_jacobi_coeff_array, "jacobi_coeff_array");
+    // timing
+    @export_symbol(ptr_timing_smooth, "timing_smooth");
+    @export_symbol(ptr_timing_smooth_apply, "timing_smooth_apply");
+    @export_symbol(ptr_timing_smooth_update, "timing_smooth_update");
+    @export_symbol(ptr_timing_residual, "timing_residual");
+    @export_symbol(ptr_timing_restrict, "timing_restrict");
+    @export_symbol(ptr_timing_interp, "timing_interp");
+    @export_symbol(ptr_timing_interp_expand_z, "timing_interp_expand_z");
+    @export_symbol(ptr_timing_interp_bcast, "timing_interp_bcast");
+    @export_symbol(ptr_timing_bcast_configure, "timing_bcast_configure");
+    @export_symbol(ptr_timing_bcast_to_all, "timing_bcast_to_all");
+    @export_symbol(ptr_timing_interp_add, "timing_interp_add");
+    @export_symbol(ptr_time_total_start_end, "time_total_start_end");
+    @export_symbol(ptr_timing_spmv_total, "timing_spmv_total");
+    @export_symbol(ptr_timing_spmv_communication, "timing_spmv_communication");
+    @export_symbol(ptr_timing_spmv_compute, "timing_spmv_compute");
+    @export_symbol(ptr_timing_setup, "timing_setup");
+    @export_symbol(ptr_timing_convergence, "timing_convergence");
+
+
+    // counters
+    @export_symbol(ptr_counter_smooth, "counter_smooth");
+    @export_symbol(ptr_counter_residual, "counter_residual");
+    @export_symbol(ptr_counter_restrict, "counter_restrict");
+    @export_symbol(ptr_counter_interp, "counter_interp");
+    @export_symbol(ptr_counter_setup_init, "counter_setup_init");
+    @export_symbol(ptr_counter_rho_check, "counter_rho_check");
+    @export_symbol(ptr_rho_history, "rho_history");
+    // @export_symbol(ptr_rho, "rho");
+    // Roofline FLOP counters
+    @export_symbol(ptr_count_fsub, "count_fsub");
+    @export_symbol(ptr_count_fmac, "count_fmac");
+    @export_symbol(ptr_count_fmul, "count_fmul");
+    @export_symbol(ptr_count_fadd, "count_fadd");
+    @export_symbol(ptr_count_fneg, "count_fneg");
+    @export_symbol(ptr_count_fmov_mem, "count_fmov_mem");
+    @export_symbol(ptr_count_fmov_zero, "count_fmov_zero");
+    @export_symbol(ptr_count_fmax, "count_fmax");
+    @export_symbol(ptr_count_fmov32, "count_fmov32");
+
+}
+
+comptime {
+   
+    @export_symbol(f_sync);
+    @export_symbol(f_enable_timer);
+    @export_symbol(f_tic_total);
+    @export_symbol(f_toc_total);
+    @export_symbol(f_gmg_vcycle);
+    @export_symbol(f_reset);
+}
+

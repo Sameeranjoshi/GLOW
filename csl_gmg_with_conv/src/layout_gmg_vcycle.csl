@@ -1,0 +1,157 @@
+// Layout for GMG V-cycle with state machine
+
+// color map: memcpy + allreduce + stencil
+//
+// color  var   color  var        color  var              color  var
+//   0   C0       9                18    EN_REDUCE_2       27   reserved (memcpy)
+//   1   C1      10                19    EN_REDUCE_3       28   reserved (memcpy)
+//   2   C2      11                20    EN_REDUCE_4       29   reserved (memcpy)
+//   3   C3      12  STATE         21    reserved (memcpy) 30   reserved (memcpy)
+//   4   C4      13                22    reserved (memcpy) 31   reserved
+//   5   C5      14  EN_STENCIL_1  23    reserved (memcpy) 32
+//   6   C6      15  EN_STENCIL_2  24                      33
+//   7   C7      16  EN_STENCIL_3  25                      34
+//   8   C8      17  EN_REDUCE_1   26                      35
+
+// Parameters
+param MAX_ZDIM: i16;
+param width: i16;
+param height: i16;
+param BLOCK_SIZE: i16;
+param LEVELS: i16;
+
+const C0: color = @get_color(0);
+const C1: color = @get_color(1);
+const C2: color = @get_color(2);
+const C3: color = @get_color(3);
+const C4: color = @get_color(4);
+const C5: color = @get_color(5);
+const C6: color = @get_color(6);
+const C7: color = @get_color(7);
+const C8: color = @get_color(8);
+
+// State machine entrypoint
+const STATE: local_task_id = @get_local_task_id(12);
+
+// Stencil entrypoints
+const EN_STENCIL_1: local_task_id = @get_local_task_id(14);
+const EN_STENCIL_2: local_task_id = @get_local_task_id(15);
+const EN_STENCIL_3: local_task_id = @get_local_task_id(16);
+
+// Allreduce entrypoints
+const EN_REDUCE_1: local_task_id = @get_local_task_id(17);
+const EN_REDUCE_2: local_task_id = @get_local_task_id(18);
+const EN_REDUCE_3: local_task_id = @get_local_task_id(19);
+const EN_REDUCE_4: local_task_id = @get_local_task_id(20);
+
+const stencil = @import_module( "./modified_csl_lib_hops/stencil_3d_7pts/layout.csl", .{
+// const stencil = @import_module( "./modified_csl_lib/stencil_3d_7pts/layout.csl", .{
+    .colors = [8]color{C0, C1, C2, C3, C4, C5, C6, C7},
+    .entrypoints = [3]local_task_id{EN_STENCIL_1, EN_STENCIL_2, EN_STENCIL_3},
+    .width = width,
+    .height = height
+    });
+
+const reduce = @import_module( "./modified_csl_lib_hops/allreduce/layout.csl", .{
+// const reduce = @import_module( "./modified_csl_lib/allreduce/layout.csl", .{
+    .colors = [1]color{C8},
+    .entrypoints = [4]local_task_id{EN_REDUCE_1, EN_REDUCE_2, EN_REDUCE_3, EN_REDUCE_4},
+    .width = width,
+    .height = height
+    });
+
+const memcpy = @import_module( "<memcpy/get_params>", .{
+    .width = width,
+    .height = height,
+    });
+
+layout{
+
+    @set_rectangle( width, height );
+
+    var py: i16 = 0;
+    while(py < height) : (py +=1) {
+        var px: i16 = 0;
+        while(px < width) : (px +=1) {
+            const memcpyParams = memcpy.get_params(px);
+            const stencilParams = stencil.get_params(px, py);
+            const reduceParams = reduce.get_params(px, py);
+            var params: comptime_struct = .{
+                .memcpyParams = memcpyParams,
+                .reduceParams = reduceParams,
+                .MAX_ZDIM = MAX_ZDIM,
+                .BLOCK_SIZE = BLOCK_SIZE,
+                .stencilParams = stencilParams,
+                .LEVELS = LEVELS,
+                .STATE = STATE,
+            };
+
+            @set_tile_code(px, py, "kernel_gmg_vcycle.csl", params);
+        }
+    }
+
+    @export_name("u", [*]f32, true);
+    @export_name("f", [*]f32, true);
+    @export_name("r", [*]f32, true);
+    @export_name("hx_array", [*]f32, true);
+    @export_name("jacobi_coeff_array", [*]f32, true);
+    // timing
+    @export_name("timing_smooth", [*]u16, true);
+    @export_name("timing_smooth_apply", [*]u16, true);
+    @export_name("timing_smooth_update", [*]u16, true);
+    @export_name("timing_residual", [*]u16, true);
+    @export_name("timing_restrict", [*]u16, true);
+    @export_name("timing_interp", [*]u16, true);
+    @export_name("timing_interp_expand_z", [*]u16, true);
+    @export_name("timing_interp_bcast", [*]u16, true);
+    @export_name("timing_bcast_configure", [*]u16, true);
+    @export_name("timing_bcast_to_all", [*]u16, true);
+    @export_name("timing_interp_add", [*]u16, true);
+    @export_name("time_total_start_end", [*]u16, true);
+    @export_name("timing_spmv_total", [*]u16, true);
+    @export_name("timing_spmv_communication", [*]u16, true);
+    @export_name("timing_spmv_compute", [*]u16, true);
+    @export_name("timing_setup", [*]u16, true);
+    @export_name("timing_convergence", [*]u16, true);
+    // roofline fabric counter
+    @export_name("count_fmov32", [*]u32, true);
+    // counters
+    @export_name("counter_smooth", [*]u32, true);
+    @export_name("counter_residual", [*]u32, true);
+    @export_name("counter_restrict", [*]u32, true);
+    @export_name("counter_interp", [*]u32, true);
+    @export_name("counter_setup_init", [*]u32, true);
+    @export_name("counter_rho_check", [*]u32, true);
+    // Roofline FLOP counters
+    @export_name("count_fsub", [*]u32, true);
+    @export_name("count_fmac", [*]u32, true);
+    @export_name("count_fmul", [*]u32, true);
+    @export_name("count_fadd", [*]u32, true);
+    @export_name("count_fneg", [*]u32, true);
+    @export_name("count_fmov_mem", [*]u32, true);
+    @export_name("count_fmov_zero", [*]u32, true);
+    @export_name("count_fmax", [*]u32, true);
+    // kernels
+    @export_name("f_enable_timer", fn()void);
+    @export_name("f_tic_total", fn()void);
+    @export_name("f_toc_total", fn()void);
+    @export_name("f_gmg_vcycle", fn(i16,i16,i16,i16,i16,f32)void);
+    @export_name("rho_history", [*]f32, true);
+    @export_name("f_reset", fn()void);
+    @export_name("f_sync", fn()void);
+    // @export_name("f_reference_timestamps", fn()void);
+    // @export_name("timing_apply_op", [*]u16, true);
+    // @export_name("time_ref", [*]u16, true);
+    // @export_name("timing_setup_init", [*]u16, true);
+    // @export_name("timing_rho_check", [*]u16, true);    
+    // @export_name("time_h2d", [*]u16, true);
+    // @export_name("time_d2h", [*]u16, true);
+    // @export_name("f_tic_h2d", fn()void);
+    // @export_name("f_toc_h2d", fn()void);
+    // @export_name("f_tic_d2h", fn()void);
+    // @export_name("f_toc_d2h", fn()void);
+    // @export_name("timing_communication", [*]u16, true);
+    // @export_name("timing_compute", [*]u16, true);
+    // @export_name("rho", [*]f32, true);
+}
+
