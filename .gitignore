@@ -1,0 +1,17 @@
+# Build artifacts
+csl_gmg_with_conv/build/
+
+# Plot outputs and logs
+csl_gmg_with_conv/plots/out_*.txt
+
+# Run metadata
+csl_gmg_with_conv/run_meta.json
+w_cycle/run_meta.json
+w_cycle/artifact_cache.json
+
+# Cluster job details
+wsjob-*-cluster-details.json
+**/wsjob-*-cluster-details.json
+
+# W-cycle output dirs
+w_cycle/w_out_dir_*/
