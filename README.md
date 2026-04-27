@@ -100,7 +100,7 @@ GLOW/
 │   │   └── modified_csl_lib_hops/  # forked stencil + allreduce w/ hops
 │   │
 │   ├── python_gmg/                 # CPU reference solver (validation)
-│   │   └── gmgoscar.py
+│   │   └── gmgpython.py
 │   │
 │   ├── plots/                      # figure / table generators
 │   │   ├── GENERATEFIGURES.sh      # one-shot driver for all figures
@@ -160,7 +160,7 @@ compatible with the SDK 1.4.0 venv.
 | `matplotlib`       | plots                                |
 | `scipy`            | host reference solver                |
 | `pandas`           | plot scripts                         |
-| `numba` (optional) | accelerates `python_gmg/gmgoscar.py` |
+| `numba` (optional) | accelerates `python_gmg/gmgpython.py` |
 
 ### Time budget
 

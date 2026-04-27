@@ -10,8 +10,8 @@ import shutil
 import copy
 import numpy as np
 # sys.path.append(os.path.join(os.path.dirname(__file__), '..', "python_gmg"))
-# from python_gmg.gmgoscar import SimpleGMG as SimpleGMGOSCAR
-from gmgoscar import SimpleGMG as SimpleGMGOSCAR
+# from python_gmg.gmgpython import SimpleGMG as SimpleGMGPYTHON
+from gmgpython import SimpleGMG as SimpleGMGPYTHON
 from cmd_parser import parse_args, print_arguments
 from util import hwl_2_oned_colmajor, oned_to_hwl_colmajor
 from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime, MemcpyOrder, MemcpyDataType
@@ -486,7 +486,7 @@ def main():
     print("\n" + "="*60)
     print("Creating reference solver on host...")
     print("="*60)
-    host_solver = SimpleGMGOSCAR(width, height, zDim, args.levels, args.verbose, 
+    host_solver = SimpleGMGPYTHON(width, height, zDim, args.levels, args.verbose,
                                  args.tolerance, args.pre_iter, args.post_iter, args.bottom_iter)
     device_solver = copy.deepcopy(host_solver)
 

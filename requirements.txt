@@ -11,4 +11,4 @@ numpy==1.24.4
 matplotlib==3.7.5
 scipy==1.10.1
 pandas==2.0.3
-numba==0.58.1   # optional; speeds up the host reference solver (python_gmg/gmgoscar.py)
+numba==0.58.1   # optional; speeds up the host reference solver (python_gmg/gmgpython.py)

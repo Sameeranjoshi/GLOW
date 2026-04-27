@@ -6,7 +6,7 @@ Demonstrates the Python implementation with various problem sizes
 
 import argparse
 # from gmg import SimpleGMG
-from gmgoscar import SimpleGMG as SimpleGMGOSCAR
+from gmgpython import SimpleGMG as SimpleGMGPYTHON
 import time
 
 
@@ -14,7 +14,7 @@ def benchmark_problem(nx, ny, nz, num_levels, verbose, abs_tolerance, pre_iter, 
     """Benchmark a single problem size"""
     print(f"\nBenchmarking {nx}x{ny}x{nz} grid with {num_levels} levels...")
     # solver = SimpleGMG(nx, ny, nz, num_levels, verbose, tolerance, pre_iter, post_iter, bottom_iter)
-    solver = SimpleGMGOSCAR(nx, ny, nz, num_levels, verbose, abs_tolerance, pre_iter, post_iter, bottom_iter)
+    solver = SimpleGMGPYTHON(nx, ny, nz, num_levels, verbose, abs_tolerance, pre_iter, post_iter, bottom_iter)
     start_time = time.time()
     # residual, iterations = solver.solve(max_iterations)
     rho_max, iterations = solver.solve_iterative(max_iterations)

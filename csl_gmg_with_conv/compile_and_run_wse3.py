@@ -306,7 +306,7 @@ def run_on_appliance(artifact_path, out_path, Run_command):
                 "cmd_parser.py",
                 "run_gmg_vcycle.py",
                 "util.py", 
-                "python_gmg/gmgoscar.py",
+                "python_gmg/gmgpython.py",
             ]
             for file_to_stage in files_to_stage:
                 launcher.stage(file_to_stage)
@@ -392,9 +392,9 @@ import time
 
 def process_on_host(size, num_levels, verbose, max_iterations, abs_tolerance, pre_iter, post_iter, bottom_iter):
     """Benchmark a single problem size"""
-    from python_gmg.gmgoscar import SimpleGMG as SimpleGMGOSCAR
+    from python_gmg.gmgpython import SimpleGMG as SimpleGMGPYTHON
     print(f"\nProcessing on host {size}x{size}x{size} grid with {num_levels} levels...")
-    solver = SimpleGMGOSCAR(size, size, size, num_levels, verbose, abs_tolerance, pre_iter, post_iter, bottom_iter)
+    solver = SimpleGMGPYTHON(size, size, size, num_levels, verbose, abs_tolerance, pre_iter, post_iter, bottom_iter)
     start_time = time.time()
     rho_max, iterations = solver.solve_iterative(max_iterations)
     reltol = solver.rel_tolerance
@@ -446,7 +446,7 @@ def main():
         (256, 8, 100, 1e-2, 4, 4, 100),   # DONE
         (512, 9, 100, 1e-2, 4, 4, 100),   # DONE
 
-        # OSCAR matching problems
+        # Python-host matching problems
         # 4/4/6
         # ls -d out_dir_S*x*_P4_P4_B6 | sed 's/.*S\([0-9]*\)x.*/\1 &/' | sort -n | cut -d' ' -f2- | xargs -I{} cat {}/response.txt > all_responses_4_4_6.txt
         (4, 2, 100, 1e-2, 4, 4, 6),   # DONE
